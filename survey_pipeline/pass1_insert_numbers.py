@@ -71,6 +71,73 @@ def _update_chart_for_single_question(slide, rows):
     return False
 
 
+def _update_chart_for_multi_questions(slide, ai_long, qids, exclude_net=True):
+    """
+    Update a multi-series category chart for a range of questions.
+
+    Assumes:
+      - Categories correspond to answer options (e.g. Very / Somewhat ...)
+      - Each series corresponds to one question ID (e.g. Q6, Q7, ...)
+    """
+    # Build per-question distributions (answer_option -> pct)
+    series_list = []
+    categories = None
+
+    for qid in qids:
+        dfq = ai_long[ai_long["question_id"] == qid].copy()
+        if dfq.empty:
+            continue
+
+        if exclude_net and "is_net" in dfq.columns:
+            non_net = dfq[dfq["is_net"] == False]
+            if not non_net.empty:
+                dfq = non_net
+
+        if "rank_pct_desc" in dfq.columns:
+            dfq = dfq.sort_values(["rank_pct_desc", "pct"], ascending=[True, False])
+        else:
+            dfq = dfq.sort_values(["pct"], ascending=False)
+
+        # Use the first question as the category order
+        if categories is None:
+            categories = [str(a).strip() for a in dfq["answer_option"].tolist()]
+
+        # Align this question's values to the shared category list
+        cat_to_pct = {
+            str(row["answer_option"]).strip(): float(row["pct"])
+            for _, row in dfq.iterrows()
+        }
+        values = [cat_to_pct.get(cat, 0.0) for cat in categories]
+        series_list.append((qid, values))
+
+    if not series_list or not categories:
+        return False
+
+    for shape in slide.shapes:
+        if not hasattr(shape, "has_chart") or not shape.has_chart:
+            continue
+
+        chart = shape.chart
+        if chart.chart_type not in (
+            XL_CHART_TYPE.COLUMN_CLUSTERED,
+            XL_CHART_TYPE.COLUMN_STACKED,
+            XL_CHART_TYPE.BAR_CLUSTERED,
+            XL_CHART_TYPE.BAR_STACKED,
+        ):
+            continue
+
+        chart_data = CategoryChartData()
+        chart_data.categories = categories
+
+        for series_name, values in series_list:
+            chart_data.add_series(series_name, values)
+
+        chart.replace_data(chart_data)
+        return True
+
+    return False
+
+
 def process_slide(slide, ai_long, top_k=3, exclude_net=True, pct_decimals=0):
     """Process a single slide: detect question, format values, replace placeholder."""
     slide_text = get_slide_text(slide)
@@ -101,7 +168,7 @@ def process_slide(slide, ai_long, top_k=3, exclude_net=True, pct_decimals=0):
             if _update_chart_for_single_question(slide, rows):
                 chart_updated = True
     else:
-        # Range of questions — grouped format
+        # Range of questions — grouped format + optional multi-series chart update
         values_text = format_values_grouped(
             ai_long, qids, top_k=top_k,
             exclude_net=exclude_net, pct_decimals=pct_decimals
@@ -109,6 +176,9 @@ def process_slide(slide, ai_long, top_k=3, exclude_net=True, pct_decimals=0):
         if not values_text:
             print(f"  [WARN] No data found for questions {qids[0]}-{qids[-1]} — using fallback text")
             values_text = fallback
+        else:
+            if _update_chart_for_multi_questions(slide, ai_long, qids, exclude_net=exclude_net):
+                chart_updated = True
 
     # Replace placeholder in all shapes
     replaced = False

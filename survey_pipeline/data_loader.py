@@ -25,7 +25,8 @@ def load_ai_long(data_path: str) -> pd.DataFrame:
     """
     xl = pd.ExcelFile(data_path)
     if "ai_long" in xl.sheet_names:
-        return pd.read_excel(xl, sheet_name="ai_long")
+        df = pd.read_excel(xl, sheet_name="ai_long")
+        return _normalize_ai_long_sheet(df)
     if "ExcelData" in xl.sheet_names:
         raw = pd.read_excel(xl, sheet_name="ExcelData")
         return _build_ai_long_from_exceldata(raw)
@@ -33,6 +34,72 @@ def load_ai_long(data_path: str) -> pd.DataFrame:
         f"Unsupported Excel format for {data_path!r} — expected a sheet named "
         "'ai_long' or 'ExcelData'."
     )
+
+
+# Canonical column names and possible aliases (exact match, case-insensitive)
+_AI_LONG_COL_MAP = [
+    ("question_id", ["question_id", "question id", "qid", "question_num", "question number"]),
+    ("question_text", ["question_text", "question text", "question_iuestion_te", "qtext"]),
+    ("base_n", ["base_n", "base n"]),
+    ("answer_option", ["answer_option", "answer option", "swer_opti", "answer", "response"]),
+    ("raw_value", ["raw_value", "raw value"]),
+    ("pct", ["pct", "pct.", "percentage", "percent"]),
+    ("rank_pct_desc", ["rank_pct_desc", "rank_pct_de", "nk_pct_de", "rank"]),
+    ("is_top3", ["is_top3", "is_top_3", "is top3", "top3"]),
+    ("is_net", ["is_net", "is net", "net"]),
+]
+
+
+def _normalize_ai_long_sheet(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalize an ai_long sheet so it has the columns the pipeline expects.
+    Handles alternate column names (e.g. question_number, truncated headers)
+    and builds question_id from a numeric column if needed.
+    """
+    if df.empty:
+        return df
+
+    col_lower_to_orig = {}
+    for c in df.columns:
+        key = str(c).strip().lower() if isinstance(c, str) else str(c).strip().lower()
+        col_lower_to_orig[key] = c
+
+    renames = {}
+    for canonical, aliases in _AI_LONG_COL_MAP:
+        if canonical in df.columns:
+            continue
+        for a in aliases:
+            key = a.strip().lower()
+            if key in col_lower_to_orig:
+                renames[col_lower_to_orig[key]] = canonical
+                break
+
+    if renames:
+        df = df.rename(columns=renames)
+
+    # Build question_id from numeric column if missing
+    if "question_id" not in df.columns:
+        for num_col in ["question_number", "question number", "question_num", "ble_numb", "qnum", "num"]:
+            if num_col in df.columns:
+                df["question_id"] = df[num_col].astype(str).str.replace(r"\.0$", "", regex=True).map(lambda x: f"Q{x}" if x and x != "nan" else None)
+                break
+        if "question_id" not in df.columns:
+            raise ValueError("ai_long sheet must have 'question_id' or a numeric question column (e.g. question_number)")
+
+    # Ensure string type and Q-prefix for question_id (e.g. 1 -> Q1, Q2 -> Q2)
+    df["question_id"] = df["question_id"].astype(str).str.strip()
+    df["question_id"] = df["question_id"].str.replace(r"^(\d+)$", r"Q\1", regex=True)
+    df = df[df["question_id"].str.match(r"^Q\d+$", na=False)].copy()
+
+    # Optional columns: add if missing
+    if "rank_pct_desc" not in df.columns and "pct" in df.columns:
+        df["rank_pct_desc"] = df.groupby("question_id")["pct"].rank(method="dense", ascending=False).astype(int)
+    if "is_top3" not in df.columns and "rank_pct_desc" in df.columns:
+        df["is_top3"] = df["rank_pct_desc"] <= 3
+    if "is_net" not in df.columns and "answer_option" in df.columns:
+        df["is_net"] = df["answer_option"].astype(str).str.contains("NET", case=False, na=False)
+
+    return df
 
 
 def _build_ai_long_from_exceldata(df: pd.DataFrame) -> pd.DataFrame:
